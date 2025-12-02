@@ -4,6 +4,8 @@ import pyzbar.pyzbar as pyzbar
 import urllib.request
 import time
 import RPi.GPIO as GPIO
+#from collections import deque
+#import QRdetection.py
 
 # --- DOOR 1 ---
 ENA_PIN = 15
@@ -41,6 +43,7 @@ pwmB = GPIO.PWM(ENB_PIN, 100)
 pwmC = GPIO.PWM(ENC_PIN, 100)
 pwmE = GPIO.PWM(ENE_PIN, 100)
 
+# --- START ALL PWMs ---
 pwmA.start(0)
 pwmB.start(0)
 pwmC.start(0)
@@ -108,41 +111,81 @@ def stopAllDoors():
     pwmB.ChangeDutyCycle(0)
     pwmC.ChangeDutyCycle(0)
 
-# ====== POSTAL PREFIX & MAPPING ======
-central = [*list(range(10, 19)), *list(range(20, 28)), *list(range(70, 78))]
-northern = [*list(range(50, 59)), *list(range(60, 68))]
-northeast = [*list(range(30, 40)), *list(range(40, 50))]
-southern = [*list(range(80, 87)), *list(range(90, 97))]
 
+
+# ====== POSTAL PREFIX ======
+central = [                 # total: 25(+1)
+    *list(range(10, 19)),   # 10-18: Bangkok + Central provinces
+    *list(range(20, 28)),   # 20-27: Eastern region
+    *list(range(70, 78)),   # 70-77: Western region
+]
+
+northern = [                # total: 17
+    *list(range(50, 59)),   # 50-58: Upper Northern region
+    *list(range(60, 68)),   # 60-67: Lower Northern region
+]
+
+northeast = [               # total: 20
+    *list(range(30, 40)),   # 30-39: Lower Isan
+    *list(range(40, 50)),   # 40-49: Upper Isan
+]
+
+southern = [                # total: 14
+    *list(range(80, 87)),   # 80-86: Upper Southern region
+    *list(range(90, 97)),   # 90-96: Lower Southern region
+]
+
+# ====== MAPPING ======
 region_map = {}
-for p in central: region_map[p] = 1
-for p in northern: region_map[p] = 2
-for p in northeast: region_map[p] = 2
-for p in southern: region_map[p] = 3
+
+for p in central:
+    region_map[p] = 1 #"central"
+
+for p in northern:
+    region_map[p] = 2 #"northern"
+
+for p in northeast:
+    region_map[p] = 2 #"northeast"
+
+for p in southern:
+    region_map[p] = 3 #"southern"
+
 
 def get_region(postal_code: str):
+    if len(postal_code) != 5:
+        return None
+    if not postal_code.isdigit():
+        return None
+    
     prefix = int(postal_code[:2])
     return region_map.get(prefix, None)
 
 # ====== MAIN ======
+# Track conveyor state
 conveyor_running = False
 
+
 def ensure_conveyor_running():
+    """Start conveyor only if not already moving."""
     global conveyor_running
     if not conveyor_running:
         start_conveyor(80)
         conveyor_running = True
         print("[CONVEYOR] Started")
 
+
 def ensure_conveyor_stopped():
+    """Stop conveyor only if no remaining parcels."""
     global conveyor_running
-    if conveyor_running:
+    if conveyor_running and len(events) == 0:
         stop_conveyor()
         conveyor_running = False
         print("[CONVEYOR] Stopped")
-
+        
 # ======  ESP32 CAMERA SETUP  ======
-URL = "http://192.168.1.55/cam-lo.jpg"
+
+URL = "http://192.168.73.22/cam-lo.jpg"
+
 cv2.namedWindow("ESP32-CAM", cv2.WINDOW_AUTOSIZE)
 last_data = b""
 
@@ -150,6 +193,7 @@ try:
     postal_input = "00000"
     while True:
         frame = None
+        # TRY TO FETCH ESP32 FRAME
         try:
             resp = urllib.request.urlopen(URL, timeout=2)
             img_bytes = resp.read()
@@ -170,6 +214,8 @@ try:
                 if data != last_data:
                     print("[QR DETECTED] Type:", obj.type, "Data:", data.decode("utf-8"))
                     last_data = data
+
+                # Display text on frame
                 cv2.putText(frame, data.decode("utf-8"), (50, 50),
                             cv2.FONT_HERSHEY_SIMPLEX, 1.2, (255, 0, 0), 3)
         except Exception as e:
@@ -178,30 +224,35 @@ try:
         if last_data != b"":  # QR detected at least once
             cur_postal_input = last_data.decode("utf-8")
             door_id = get_region(cur_postal_input)
-            if cur_postal_input != postal_input:
-                if door_id is None:
-                    print("[ERROR] Unreadable postal → sending to end of conveyor")
-                    door_id = 0
-                    time.sleep(0.05)
-                    continue
-                else:
-                    open_door(door_id)
-                    ensure_conveyor_running()
-                    time.sleep(door_id)
-                    close_door(door_id)
-                    ensure_conveyor_stopped()
-                    
-                    # RESET FOR NEXT QR CODE
-                    last_data = b""
-                    postal_input = "00000"
-                    print("[SYSTEM] Ready for next QR code")
-                    
+            #if cur_postal_input != postal_input:
+            if door_id is None:
+                print("[ERROR] Invalid postal → sending to end of conveyor")
+                start_conveyor(80)
+                time.sleep(2)
+                stop_conveyor()
+                
+                #RESET FOR NEXT QR
+                last_data = b""
+                postal_input = "00000"
+                print("[SYSTEM] Ready for next QR code")
+            else:
+                print(f"[SCHEDULE] Parcel → Door {door_id}")
+                open_door(door_id)
+                start_conveyor(80)
+                time.sleep(door_id-0.4*door_id)
+                close_door(door_id)
+                stop_conveyor()
+                
+                #RESET FOR NEXT QR
+                last_data = b""
+                postal_input = "00000"
+                print("[SYSTEM] Ready for next QR code")
             postal_input = cur_postal_input
             
         cv2.imshow("ESP32-CAM", frame)
-        if cv2.waitKey(1) == 27:
-            break
-        time.sleep(0.05)
+        #if cv2.waitKey(1) == 27:
+            #break
+        time.sleep(0.02)
 
 except KeyboardInterrupt:
     pass
@@ -212,6 +263,7 @@ finally:
     stop_conveyor()
     for pwm in (pwmA, pwmB, pwmC, pwmE):
         pwm.stop()
-    cv2.destroyAllWindows()
     GPIO.cleanup()
     print("[SYSTEM] Shutdown")
+
+
